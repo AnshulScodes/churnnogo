@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Pencil, Users, BarChart, ArrowRight, MessageSquare, PercentSquare, GitFork, Heart } from 'lucide-react';
@@ -75,31 +74,36 @@ const Dashboard = () => {
     queryFn: async () => {
       if (!activeClient?.id) return [];
       
-      const { data, error } = await supabase
+      const { data: predictionsData, error: predictionsError } = await supabase
         .from('predictions')
-        .select(`
-          id, 
-          user_id, 
-          risk_score, 
-          risk_factors, 
-          created_at,
-          user_profiles!inner(last_active)
-        `)
+        .select('id, user_id, risk_score, risk_factors, created_at')
         .eq('client_id', activeClient.id)
         .gt('risk_score', 0.5) // Risk score > 0.5 (50%)
         .order('risk_score', { ascending: false })
         .limit(5);
       
-      if (error) throw error;
+      if (predictionsError) throw predictionsError;
       
-      // Transform data for the table component
-      return data.map(item => ({
-        id: item.id,
-        name: `User ${item.user_id.substring(0, 8)}`,
-        email: `user${item.user_id.substring(0, 4)}@example.com`,
-        lastActive: formatLastActive(item.user_profiles.last_active),
-        riskScore: item.risk_score
+      const usersWithActivity = await Promise.all(predictionsData.map(async (prediction) => {
+        const { data: userProfile, error: userProfileError } = await supabase
+          .from('user_profiles')
+          .select('last_active')
+          .eq('client_id', activeClient.id)
+          .eq('user_id', prediction.user_id)
+          .single();
+        
+        const lastActive = userProfileError ? new Date().toISOString() : userProfile?.last_active;
+        
+        return {
+          id: prediction.id,
+          name: `User ${prediction.user_id.substring(0, 8)}`,
+          email: `user${prediction.user_id.substring(0, 4)}@example.com`,
+          lastActive: formatLastActive(lastActive),
+          riskScore: prediction.risk_score
+        };
       }));
+      
+      return usersWithActivity;
     },
     enabled: !!activeClient?.id
   });
