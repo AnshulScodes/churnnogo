@@ -1,4 +1,3 @@
-
 // Predict Churn Risk Edge Function
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -51,73 +50,76 @@ serve(async (req) => {
 
     // If user_id is provided, get prediction for specific user
     if (user_id) {
-      const { data: predictionData, error: predictionError } = await supabase
+      // Check if there's a recent prediction (less than 24 hours old)
+      const { data: recentPrediction, error: recentPredictionError } = await supabase
         .from('predictions')
         .select('*')
         .eq('client_id', client_id)
         .eq('user_id', user_id)
+        .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
         .order('created_at', { ascending: false })
         .limit(1)
         .single();
 
-      if (predictionError && predictionError.code !== 'PGRST116') {
-        console.error("Prediction retrieval error:", predictionError);
+      // If there's a recent prediction and no error, return it
+      if (recentPrediction && !recentPredictionError) {
         return new Response(
-          JSON.stringify({ error: "Failed to retrieve prediction data" }),
-          { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
-        );
-      }
-
-      if (!predictionData) {
-        // If no prediction exists, calculate a new one
-        const { data: userEvents, error: eventsError } = await supabase
-          .from('events')
-          .select('*')
-          .eq('client_id', client_id)
-          .eq('user_id', user_id)
-          .order('timestamp', { ascending: false });
-
-        if (eventsError) {
-          console.error("Events retrieval error:", eventsError);
-          return new Response(
-            JSON.stringify({ error: "Failed to retrieve user events" }),
-            { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
-          );
-        }
-
-        // Simple prediction model based on user events
-        // In a real implementation, this would use more sophisticated algorithms
-        const risk_score = calculateRiskScore(userEvents || []);
-        const risk_factors = determineRiskFactors(userEvents || []);
-
-        // Save the prediction
-        const { data: newPrediction, error: insertError } = await supabase
-          .from('predictions')
-          .insert([{
-            client_id,
-            user_id,
-            risk_score,
-            risk_factors
-          }])
-          .select()
-          .single();
-
-        if (insertError) {
-          console.error("Prediction insertion error:", insertError);
-          return new Response(
-            JSON.stringify({ error: "Failed to save prediction" }),
-            { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
-          );
-        }
-
-        return new Response(
-          JSON.stringify({ prediction: newPrediction }),
+          JSON.stringify({ prediction: recentPrediction }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
         );
       }
 
+      // Otherwise, calculate a new prediction
+      // Get user events for analysis
+      const { data: userEvents, error: eventsError } = await supabase
+        .from('events')
+        .select('*')
+        .eq('client_id', client_id)
+        .eq('user_id', user_id)
+        .order('timestamp', { ascending: false });
+
+      if (eventsError) {
+        console.error("Events retrieval error:", eventsError);
+        return new Response(
+          JSON.stringify({ error: "Failed to retrieve user events" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+        );
+      }
+
+      // Get user profile for additional context
+      const { data: userProfile, error: profileError } = await supabase
+        .from('user_profiles')
+        .select('*')
+        .eq('client_id', client_id)
+        .eq('user_id', user_id)
+        .single();
+
+      // Enhanced prediction model with more factors
+      const risk_score = calculateRiskScore(userEvents || [], userProfile);
+      const risk_factors = determineRiskFactors(userEvents || [], userProfile);
+
+      // Save the prediction
+      const { data: newPrediction, error: insertError } = await supabase
+        .from('predictions')
+        .insert([{
+          client_id,
+          user_id,
+          risk_score,
+          risk_factors
+        }])
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error("Prediction insertion error:", insertError);
+        return new Response(
+          JSON.stringify({ error: "Failed to save prediction" }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+        );
+      }
+
       return new Response(
-        JSON.stringify({ prediction: predictionData }),
+        JSON.stringify({ prediction: newPrediction }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
       );
     } else {
@@ -150,14 +152,16 @@ serve(async (req) => {
   }
 });
 
-// Simple risk score calculation based on user activity
-function calculateRiskScore(events: any[]): number {
+// Enhanced risk score calculation with more factors
+function calculateRiskScore(events, userProfile) {
   if (events.length === 0) return 0.5; // Default medium risk if no events
   
-  // Sample factors that might indicate churn risk:
+  // Risk factors to consider:
   // 1. Recency of activity (more recent = lower risk)
   // 2. Frequency of activity (more activity = lower risk)
-  // 3. Types of events (certain patterns may indicate higher risk)
+  // 3. Types of events (certain patterns indicate higher risk)
+  // 4. Time since registration (newer users may have higher churn risk)
+  // 5. Error events (more errors = higher risk)
   
   const now = new Date();
   const lastEventTime = new Date(events[0].timestamp);
@@ -169,8 +173,27 @@ function calculateRiskScore(events: any[]): number {
   // Frequency factor: More events = lower risk
   const frequencyFactor = Math.max(1 - events.length / 100, 0); // Scales with up to 100 events
   
-  // Calculate final risk score (0-1 scale)
-  let riskScore = (recencyFactor * 0.7) + (frequencyFactor * 0.3);
+  // Error factor: More errors = higher risk
+  const errorEvents = events.filter(e => e.event_type === 'error' || e.event_type === 'promise_rejection');
+  const errorFactor = Math.min(errorEvents.length / 10, 1); // Scales with up to 10 errors
+  
+  // Engagement factor: More page views and clicks = lower risk
+  const engagementEvents = events.filter(e => e.event_type === 'page_view' || e.event_type === 'click');
+  const engagementFactor = Math.max(1 - engagementEvents.length / 50, 0); // Scales with up to 50 engagement events
+  
+  // Tenure factor: Based on first_seen from user profile
+  let tenureFactor = 0.5; // Default
+  if (userProfile && userProfile.first_seen) {
+    const daysSinceRegistration = (now.getTime() - new Date(userProfile.first_seen).getTime()) / (1000 * 60 * 60 * 24);
+    tenureFactor = Math.max(1 - daysSinceRegistration / 90, 0); // Higher risk for newer users, scales with up to 90 days
+  }
+  
+  // Calculate final risk score (0-1 scale) with weighted factors
+  let riskScore = (recencyFactor * 0.3) + 
+                  (frequencyFactor * 0.2) + 
+                  (errorFactor * 0.2) + 
+                  (engagementFactor * 0.2) + 
+                  (tenureFactor * 0.1);
   
   // Ensure the score is between 0 and 1
   riskScore = Math.max(0, Math.min(1, riskScore));
@@ -178,9 +201,9 @@ function calculateRiskScore(events: any[]): number {
   return riskScore;
 }
 
-// Determine contributing factors to the risk score
-function determineRiskFactors(events: any[]): any {
-  const factors: any = {};
+// Enhanced determination of risk factors
+function determineRiskFactors(events, userProfile) {
+  const factors = {};
   
   if (events.length === 0) {
     factors.no_data = "No activity data available";
@@ -191,18 +214,42 @@ function determineRiskFactors(events: any[]): any {
   const lastEventTime = new Date(events[0].timestamp);
   const daysSinceLastActivity = (now.getTime() - lastEventTime.getTime()) / (1000 * 60 * 60 * 24);
   
+  // Inactivity factor
   if (daysSinceLastActivity > 14) {
     factors.inactivity = "User has not been active for more than 2 weeks";
+  } else if (daysSinceLastActivity > 7) {
+    factors.low_activity = "User has low activity in the past week";
   }
   
+  // Engagement factors
   if (events.length < 5) {
     factors.low_engagement = "User has very few interactions";
   }
   
-  // Analyze page visit patterns
+  // Page visit patterns
   const pageVisits = events.filter(e => e.event_type === 'page_view');
   if (pageVisits.length < 3) {
     factors.limited_exploration = "User has viewed very few pages";
+  }
+  
+  // Error experience
+  const errorEvents = events.filter(e => e.event_type === 'error' || e.event_type === 'promise_rejection');
+  if (errorEvents.length > 3) {
+    factors.error_prone = "User encountered multiple errors";
+  }
+  
+  // Session patterns
+  const uniqueSessions = new Set(events.map(e => e.session_id)).size;
+  if (uniqueSessions < 2 && events.length > 10) {
+    factors.single_session = "User doesn't return for multiple sessions";
+  }
+  
+  // New user risk
+  if (userProfile && userProfile.first_seen) {
+    const daysSinceRegistration = (now.getTime() - new Date(userProfile.first_seen).getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceRegistration < 7) {
+      factors.new_user = "Recently registered user with limited history";
+    }
   }
   
   return factors;

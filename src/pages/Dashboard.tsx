@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Pencil, Users, BarChart, ArrowRight, MessageSquare, PercentSquare, GitFork, Heart } from 'lucide-react';
@@ -46,6 +47,40 @@ const Dashboard = () => {
       
       if (error) throw error;
       return { count: count || 0 };
+    },
+    enabled: !!activeClient?.id
+  });
+
+  // Fetch events count for user activity
+  const { data: eventsData, isLoading: isEventsLoading } = useQuery({
+    queryKey: ['events', activeClient?.id],
+    queryFn: async () => {
+      if (!activeClient?.id) return { count: 0, eventTypes: {} };
+      
+      const { count, error } = await supabase
+        .from('events')
+        .select('*', { count: 'exact', head: true })
+        .eq('client_id', activeClient.id);
+      
+      if (error) throw error;
+      
+      // Get event types distribution
+      const { data: eventTypesData, error: eventTypesError } = await supabase
+        .from('events')
+        .select('event_type')
+        .eq('client_id', activeClient.id);
+        
+      const eventTypes = {};
+      if (eventTypesData) {
+        eventTypesData.forEach(event => {
+          eventTypes[event.event_type] = (eventTypes[event.event_type] || 0) + 1;
+        });
+      }
+      
+      return { 
+        count: count || 0,
+        eventTypes
+      };
     },
     enabled: !!activeClient?.id
   });
@@ -108,40 +143,151 @@ const Dashboard = () => {
     enabled: !!activeClient?.id
   });
 
-  // Fetch monthly churn data
+  // Fetch monthly churn data based on actual predictions
   const { data: monthlyChurnData, isLoading: isMonthlyChurnLoading } = useQuery({
     queryKey: ['monthlyChurn', activeClient?.id],
     queryFn: async () => {
-      // In a real implementation, this would fetch actual monthly data
-      // For now, generate sample data
-      return [
-        { name: 'Jan', churned: 5.2, retained: 94.8 },
-        { name: 'Feb', churned: 4.8, retained: 95.2 },
-        { name: 'Mar', churned: 6.3, retained: 93.7 },
-        { name: 'Apr', churned: 7.1, retained: 92.9 },
-        { name: 'May', churned: 6.5, retained: 93.5 },
-        { name: 'Jun', churned: 4.2, retained: 95.8 },
-        { name: 'Jul', churned: 3.8, retained: 96.2 },
-        { name: 'Aug', churned: 3.2, retained: 96.8 },
-      ];
-    }
+      if (!activeClient?.id) {
+        // Return sample data if no client
+        return generateMonthlyChurnSampleData();
+      }
+      
+      const { data: predictionsData, error: predictionsError } = await supabase
+        .from('predictions')
+        .select('risk_score, created_at')
+        .eq('client_id', activeClient.id);
+      
+      if (predictionsError || !predictionsData || predictionsData.length === 0) {
+        // Return sample data if error or no data
+        return generateMonthlyChurnSampleData();
+      }
+      
+      // Group predictions by month and calculate average churn rate
+      const monthlyData = groupPredictionsByMonth(predictionsData);
+      return monthlyData;
+    },
+    enabled: !!activeClient?.id
   });
 
-  // Fetch churn reasons data
+  // Fetch churn reasons data from risk_factors
   const { data: churnReasonData, isLoading: isChurnReasonLoading } = useQuery({
     queryKey: ['churnReasons', activeClient?.id],
     queryFn: async () => {
-      // In a real implementation, this would analyze risk factors
-      // For now, generate sample data
-      return [
-        { name: 'Price', value: 35 },
-        { name: 'Features', value: 25 },
-        { name: 'UX Issues', value: 20 },
-        { name: 'Competition', value: 15 },
-        { name: 'Other', value: 5 },
-      ];
-    }
+      if (!activeClient?.id) {
+        // Return sample data if no client
+        return generateChurnReasonsSampleData();
+      }
+      
+      const { data: predictionsData, error: predictionsError } = await supabase
+        .from('predictions')
+        .select('risk_factors')
+        .eq('client_id', activeClient.id)
+        .gt('risk_score', 0.5);
+      
+      if (predictionsError || !predictionsData || predictionsData.length === 0) {
+        // Return sample data if error or no data
+        return generateChurnReasonsSampleData();
+      }
+      
+      // Extract and aggregate risk factors
+      const reasons = aggregateRiskFactors(predictionsData);
+      return reasons;
+    },
+    enabled: !!activeClient?.id
   });
+
+  // Helper function to generate sample monthly churn data
+  const generateMonthlyChurnSampleData = () => {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug'];
+    return months.map(name => ({
+      name,
+      churned: Math.random() * 8 + 2, // Random value between 2-10
+      retained: 100 - (Math.random() * 8 + 2)
+    }));
+  };
+
+  // Helper function to generate sample churn reasons data
+  const generateChurnReasonsSampleData = () => {
+    return [
+      { name: 'Price', value: 35 },
+      { name: 'Features', value: 25 },
+      { name: 'UX Issues', value: 20 },
+      { name: 'Competition', value: 15 },
+      { name: 'Other', value: 5 },
+    ];
+  };
+
+  // Helper function to group predictions by month
+  const groupPredictionsByMonth = (predictionsData) => {
+    const months = {};
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    
+    predictionsData.forEach(pred => {
+      const date = new Date(pred.created_at);
+      const monthKey = `${date.getFullYear()}-${date.getMonth()}`;
+      const monthName = monthNames[date.getMonth()];
+      
+      if (!months[monthKey]) {
+        months[monthKey] = {
+          name: monthName,
+          totalScore: 0,
+          count: 0
+        };
+      }
+      
+      months[monthKey].totalScore += pred.risk_score;
+      months[monthKey].count += 1;
+    });
+    
+    // Convert to array and calculate average churn rate
+    return Object.values(months).map((month: any) => {
+      const avgChurnRate = (month.totalScore / month.count) * 100;
+      return {
+        name: month.name,
+        churned: parseFloat(avgChurnRate.toFixed(1)),
+        retained: parseFloat((100 - avgChurnRate).toFixed(1))
+      };
+    });
+  };
+
+  // Helper function to extract and aggregate risk factors
+  const aggregateRiskFactors = (predictionsData) => {
+    const factorCounts = {};
+    let totalFactors = 0;
+    
+    predictionsData.forEach(pred => {
+      const factors = pred.risk_factors || {};
+      
+      Object.keys(factors).forEach(factor => {
+        if (!factorCounts[factor]) {
+          factorCounts[factor] = 0;
+        }
+        factorCounts[factor] += 1;
+        totalFactors += 1;
+      });
+    });
+    
+    // Convert to array and calculate percentages
+    return Object.keys(factorCounts).map(name => {
+      const percentage = Math.round((factorCounts[name] / totalFactors) * 100);
+      return {
+        name: formatRiskFactorName(name),
+        value: percentage || 1 // Ensure at least 1% for visibility
+      };
+    }).sort((a, b) => b.value - a.value);
+  };
+
+  // Format risk factor names for display
+  const formatRiskFactorName = (key) => {
+    if (!key) return 'Unknown';
+    
+    // Convert snake_case or camelCase to Title Case with spaces
+    return key
+      .replace(/([A-Z])/g, ' $1') // Insert space before capital letters
+      .replace(/_/g, ' ') // Replace underscores with spaces
+      .replace(/^\w/, c => c.toUpperCase()) // Capitalize first letter
+      .trim();
+  };
 
   const toggleSidebar = () => {
     setIsSidebarOpen(!isSidebarOpen);
@@ -192,7 +338,8 @@ const Dashboard = () => {
 
   // Combined loading state for UI components
   const isLoading = isClientsLoading || isUserProfilesLoading || isPredictionsLoading || 
-                   isAtRiskUsersLoading || isMonthlyChurnLoading || isChurnReasonLoading;
+                   isAtRiskUsersLoading || isMonthlyChurnLoading || isChurnReasonLoading ||
+                   isEventsLoading;
 
   // Handle errors
   useEffect(() => {
@@ -262,13 +409,13 @@ const Dashboard = () => {
               description="Predicted to churn"
             />
             <DashboardCard 
-              title="Retention Rate"
-              value={isPredictionsLoading ? "..." : `${100 - calculateChurnRate(predictionsData)}%`}
-              change={0.8}
+              title="Total Events"
+              value={isEventsLoading ? "..." : eventsData?.count.toString() || "0"}
+              change={8.2}
               isLoading={isLoading}
-              icon={<Heart size={18} />}
+              icon={<Activity size={18} />}
               className="animate-fade-up"
-              description="Last 30 days"
+              description="User interactions"
             />
           </div>
           

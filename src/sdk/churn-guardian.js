@@ -1,7 +1,7 @@
 
 /**
  * ChurnGuardian - User behavior tracking SDK for churn prediction
- * v1.0.0
+ * v1.0.1
  */
 (function (window) {
   const ChurnGuardian = function (config) {
@@ -20,7 +20,9 @@
       trackErrors: config.trackErrors !== false,
       identifyFromUrl: config.identifyFromUrl || false,
       userIdParam: config.userIdParam || 'uid',
-      debug: config.debug || false
+      debug: config.debug || false,
+      retryAttempts: config.retryAttempts || 3,
+      retryDelay: config.retryDelay || 1000
     };
 
     // State
@@ -29,7 +31,9 @@
       sessionId: this._generateSessionId(),
       startTime: new Date(),
       initialized: false,
-      eventQueue: []
+      eventQueue: [],
+      requestsInProgress: 0,
+      errorCount: 0
     };
 
     // Initialize
@@ -43,52 +47,74 @@
     _init: function () {
       if (this.state.initialized) return;
 
-      // Save user ID to storage
-      this._saveUserIdToStorage(this.state.userId);
+      try {
+        // Save user ID to storage
+        this._saveUserIdToStorage(this.state.userId);
 
-      // Extract user ID from URL if configured
-      if (this.config.identifyFromUrl) {
-        const urlUserId = this._getUserIdFromUrl();
-        if (urlUserId) {
-          this.identify(urlUserId);
+        // Extract user ID from URL if configured
+        if (this.config.identifyFromUrl) {
+          const urlUserId = this._getUserIdFromUrl();
+          if (urlUserId) {
+            this.identify(urlUserId);
+          }
         }
-      }
 
-      // Set up event listeners
-      if (this.config.trackPageViews) {
-        this._trackPageView();
-        
-        // Track navigation events
-        if (window.history && window.history.pushState) {
-          const originalPushState = window.history.pushState;
-          window.history.pushState = function (...args) {
-            originalPushState.apply(this, args);
-            this._trackPageView();
-          }.bind(this);
+        // Set up event listeners
+        if (this.config.trackPageViews) {
+          this._trackPageView();
           
-          window.addEventListener('popstate', this._trackPageView.bind(this));
+          // Track navigation events
+          if (window.history && window.history.pushState) {
+            const originalPushState = window.history.pushState;
+            window.history.pushState = function (...args) {
+              originalPushState.apply(this, args);
+              this._trackPageView();
+            }.bind(this);
+            
+            window.addEventListener('popstate', this._trackPageView.bind(this));
+          }
         }
+
+        if (this.config.trackClicks) {
+          document.addEventListener('click', this._handleClick.bind(this));
+        }
+
+        if (this.config.trackForms) {
+          document.addEventListener('submit', this._handleFormSubmit.bind(this));
+        }
+
+        if (this.config.trackErrors) {
+          window.addEventListener('error', this._handleError.bind(this));
+          window.addEventListener('unhandledrejection', this._handlePromiseRejection.bind(this));
+        }
+
+        // Track heartbeat for session duration
+        this._setupHeartbeat();
+
+        // Mark as initialized
+        this.state.initialized = true;
+        this._log('ChurnGuardian initialized');
+
+        // Process any queued events
+        this._processQueue();
+      } catch (error) {
+        console.error('ChurnGuardian: Error during initialization:', error);
       }
+    },
 
-      if (this.config.trackClicks) {
-        document.addEventListener('click', this._handleClick.bind(this));
-      }
-
-      if (this.config.trackForms) {
-        document.addEventListener('submit', this._handleFormSubmit.bind(this));
-      }
-
-      if (this.config.trackErrors) {
-        window.addEventListener('error', this._handleError.bind(this));
-        window.addEventListener('unhandledrejection', this._handlePromiseRejection.bind(this));
-      }
-
-      // Mark as initialized
-      this.state.initialized = true;
-      this._log('ChurnGuardian initialized');
-
-      // Process any queued events
-      this._processQueue();
+    /**
+     * Set up heartbeat to track session duration
+     */
+    _setupHeartbeat: function() {
+      const HEARTBEAT_INTERVAL = 60000; // 1 minute
+      
+      setInterval(() => {
+        if (document.visibilityState === 'visible') {
+          this.track('heartbeat', {
+            session_duration: Math.floor((new Date() - this.state.startTime) / 1000)
+          });
+        }
+      }, HEARTBEAT_INTERVAL);
     },
 
     /**
@@ -99,15 +125,26 @@
     identify: function (userId, traits = {}) {
       if (!userId) return;
 
-      this.state.userId = userId;
-      this._saveUserIdToStorage(userId);
-      
-      this.track('identify', {
-        previous_id: this.state.userId !== userId ? this.state.userId : undefined,
-        traits: traits
-      });
-      
-      this._log('User identified:', userId, traits);
+      try {
+        const previousId = this.state.userId !== userId ? this.state.userId : undefined;
+        this.state.userId = userId;
+        this._saveUserIdToStorage(userId);
+        
+        this.track('identify', {
+          previous_id: previousId,
+          traits: traits
+        });
+        
+        this._log('User identified:', userId, traits);
+        
+        // Update all queued events with the new user ID
+        this.state.eventQueue = this.state.eventQueue.map(event => {
+          event.user_id = userId;
+          return event;
+        });
+      } catch (error) {
+        console.error('ChurnGuardian: Error during identify:', error);
+      }
     },
 
     /**
@@ -118,22 +155,26 @@
     track: function (eventName, properties = {}) {
       if (!eventName) return;
 
-      const event = {
-        api_key: this.config.apiKey,
-        user_id: this.state.userId,
-        session_id: this.state.sessionId,
-        event_type: eventName,
-        page_url: window.location.href,
-        element_info: {
-          ...properties,
-          timestamp: new Date().toISOString(),
-          user_agent: navigator.userAgent,
-          referrer: document.referrer || ''
-        }
-      };
+      try {
+        const event = {
+          api_key: this.config.apiKey,
+          user_id: this.state.userId,
+          session_id: this.state.sessionId,
+          event_type: eventName,
+          page_url: window.location.href,
+          element_info: {
+            ...properties,
+            timestamp: new Date().toISOString(),
+            user_agent: navigator.userAgent,
+            referrer: document.referrer || ''
+          }
+        };
 
-      this._sendEvent(event);
-      this._log('Event tracked:', eventName, properties);
+        this._sendEvent(event);
+        this._log('Event tracked:', eventName, properties);
+      } catch (error) {
+        console.error('ChurnGuardian: Error during track:', error);
+      }
     },
 
     /**
@@ -147,25 +188,42 @@
         return;
       }
 
-      fetch(`${this.config.endpoint}/predict-churn`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          api_key: this.config.apiKey,
-          user_id: this.state.userId
+      try {
+        this.state.requestsInProgress++;
+        
+        fetch(`${this.config.endpoint}/predict-churn`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            api_key: this.config.apiKey,
+            user_id: this.state.userId
+          })
         })
-      })
-      .then(response => response.json())
-      .then(data => {
-        this._log('Prediction received:', data);
-        if (callback) callback(null, data.prediction);
-      })
-      .catch(error => {
-        this._log('Error getting prediction:', error);
+        .then(response => {
+          if (!response.ok) {
+            throw new Error(`HTTP error ${response.status}`);
+          }
+          return response.json();
+        })
+        .then(data => {
+          this._log('Prediction received:', data);
+          this.state.requestsInProgress--;
+          if (callback) callback(null, data.prediction);
+        })
+        .catch(error => {
+          this._log('Error getting prediction:', error);
+          this.state.requestsInProgress--;
+          this.state.errorCount++;
+          if (callback) callback(error, null);
+        });
+      } catch (error) {
+        this.state.requestsInProgress--;
+        this.state.errorCount++;
+        console.error('ChurnGuardian: Error during getPrediction:', error);
         if (callback) callback(error, null);
-      });
+      }
     },
 
     /**
@@ -173,6 +231,7 @@
      */
     resetSession: function () {
       this.state.sessionId = this._generateSessionId();
+      this.state.startTime = new Date();
       this._log('Session reset:', this.state.sessionId);
     },
 
@@ -192,21 +251,25 @@
      * @param {Event} event - DOM click event
      */
     _handleClick: function (event) {
-      const target = event.target.closest('a, button, input[type="button"], input[type="submit"]');
-      if (!target) return;
+      try {
+        const target = event.target.closest('a, button, input[type="button"], input[type="submit"]');
+        if (!target) return;
 
-      const properties = {
-        element_type: target.tagName.toLowerCase(),
-        element_id: target.id || undefined,
-        element_class: target.className || undefined,
-        element_text: target.innerText || target.value || undefined
-      };
+        const properties = {
+          element_type: target.tagName.toLowerCase(),
+          element_id: target.id || undefined,
+          element_class: target.className || undefined,
+          element_text: target.innerText || target.value || undefined
+        };
 
-      if (target.tagName.toLowerCase() === 'a') {
-        properties.href = target.href;
+        if (target.tagName.toLowerCase() === 'a') {
+          properties.href = target.href;
+        }
+
+        this.track('click', properties);
+      } catch (error) {
+        console.error('ChurnGuardian: Error handling click:', error);
       }
-
-      this.track('click', properties);
     },
 
     /**
@@ -214,14 +277,18 @@
      * @param {Event} event - Form submission event
      */
     _handleFormSubmit: function (event) {
-      const form = event.target;
-      if (!form || form.tagName.toLowerCase() !== 'form') return;
+      try {
+        const form = event.target;
+        if (!form || form.tagName.toLowerCase() !== 'form') return;
 
-      this.track('form_submit', {
-        form_id: form.id || undefined,
-        form_name: form.name || undefined,
-        form_action: form.action || undefined
-      });
+        this.track('form_submit', {
+          form_id: form.id || undefined,
+          form_name: form.name || undefined,
+          form_action: form.action || undefined
+        });
+      } catch (error) {
+        console.error('ChurnGuardian: Error handling form submit:', error);
+      }
     },
 
     /**
@@ -229,13 +296,17 @@
      * @param {ErrorEvent} event - Error event
      */
     _handleError: function (event) {
-      this.track('error', {
-        message: event.message,
-        source: event.filename,
-        line: event.lineno,
-        column: event.colno,
-        stack: event.error ? event.error.stack : undefined
-      });
+      try {
+        this.track('error', {
+          message: event.message,
+          source: event.filename,
+          line: event.lineno,
+          column: event.colno,
+          stack: event.error ? event.error.stack : undefined
+        });
+      } catch (error) {
+        console.error('ChurnGuardian: Error handling error event:', error);
+      }
     },
 
     /**
@@ -243,9 +314,13 @@
      * @param {PromiseRejectionEvent} event - Promise rejection event
      */
     _handlePromiseRejection: function (event) {
-      this.track('promise_rejection', {
-        message: event.reason ? (event.reason.message || String(event.reason)) : 'Promise rejected'
-      });
+      try {
+        this.track('promise_rejection', {
+          message: event.reason ? (event.reason.message || String(event.reason)) : 'Promise rejected'
+        });
+      } catch (error) {
+        console.error('ChurnGuardian: Error handling promise rejection:', error);
+      }
     },
 
     /**
@@ -258,32 +333,60 @@
         return;
       }
 
-      fetch(`${this.config.endpoint}/track-event`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(event)
-      })
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`HTTP error ${response.status}`);
-        }
-        return response.json();
-      })
-      .then(data => {
-        this._log('Event sent successfully:', event.event_type);
-      })
-      .catch(error => {
-        this._log('Error sending event:', error);
-        // Retry logic could be implemented here
-      });
+      // Limit concurrent requests
+      if (this.state.requestsInProgress > 10) {
+        this.state.eventQueue.push(event);
+        return;
+      }
+
+      this.state.requestsInProgress++;
+      
+      const sendWithRetry = (retryCount = 0) => {
+        fetch(`${this.config.endpoint}/track-event`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(event)
+        })
+        .then(response => {
+          if (!response.ok) {
+            throw new Error(`HTTP error ${response.status}`);
+          }
+          return response.json();
+        })
+        .then(data => {
+          this._log('Event sent successfully:', event.event_type);
+          this.state.requestsInProgress--;
+          this._processQueue(); // Process next event in queue
+        })
+        .catch(error => {
+          this._log('Error sending event:', error);
+          
+          // Retry logic
+          if (retryCount < this.config.retryAttempts) {
+            setTimeout(() => {
+              sendWithRetry(retryCount + 1);
+            }, this.config.retryDelay * Math.pow(2, retryCount));
+          } else {
+            this.state.errorCount++;
+            this.state.requestsInProgress--;
+            this._processQueue(); // Continue to next event after max retries
+          }
+        });
+      };
+
+      sendWithRetry();
     },
 
     /**
      * Process queued events
      */
     _processQueue: function () {
+      if (this.state.eventQueue.length === 0 || this.state.requestsInProgress > 10) {
+        return;
+      }
+
       const queue = [...this.state.eventQueue];
       this.state.eventQueue = [];
 
@@ -319,6 +422,7 @@
       try {
         return localStorage.getItem('cg_user_id');
       } catch (e) {
+        this._log('Error getting user ID from storage:', e);
         return null;
       }
     },
@@ -340,8 +444,13 @@
      * @returns {string|null} User ID from URL
      */
     _getUserIdFromUrl: function () {
-      const urlParams = new URLSearchParams(window.location.search);
-      return urlParams.get(this.config.userIdParam);
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.get(this.config.userIdParam);
+      } catch (e) {
+        this._log('Error extracting user ID from URL:', e);
+        return null;
+      }
     },
 
     /**

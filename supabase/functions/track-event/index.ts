@@ -81,22 +81,69 @@ serve(async (req) => {
       );
     }
 
-    // Update or create user profile
+    // Update user profile or create if it doesn't exist
     if (user_id) {
-      const { data: profileData, error: profileError } = await supabase
+      // Check if user profile exists
+      const { data: existingProfile, error: profileCheckError } = await supabase
         .from('user_profiles')
-        .upsert([{
-          client_id,
-          user_id,
-          last_active: new Date().toISOString()
-        }], {
-          onConflict: 'client_id, user_id',
-          ignoreDuplicates: false
-        });
+        .select('id, first_seen')
+        .eq('client_id', client_id)
+        .eq('user_id', user_id)
+        .maybeSingle();
 
-      if (profileError) {
-        console.error("User profile update error:", profileError);
-        // Continue even if profile update fails
+      if (profileCheckError) {
+        console.error("Error checking user profile:", profileCheckError);
+      }
+
+      if (existingProfile) {
+        // Update existing profile
+        const { error: updateError } = await supabase
+          .from('user_profiles')
+          .update({
+            last_active: new Date().toISOString()
+          })
+          .eq('client_id', client_id)
+          .eq('user_id', user_id);
+
+        if (updateError) {
+          console.error("Error updating user profile:", updateError);
+        }
+      } else {
+        // Create new profile
+        const { error: insertError } = await supabase
+          .from('user_profiles')
+          .insert([{
+            client_id,
+            user_id,
+            first_seen: new Date().toISOString(),
+            last_active: new Date().toISOString()
+          }]);
+
+        if (insertError) {
+          console.error("Error creating user profile:", insertError);
+        }
+      }
+
+      // After significant events (page view, form submit), trigger a new churn prediction
+      if (['page_view', 'form_submit', 'identify'].includes(event_type)) {
+        try {
+          const predictionResponse = await fetch(`${req.url.split('/track-event')[0]}/predict-churn`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              api_key,
+              user_id
+            })
+          });
+          
+          if (!predictionResponse.ok) {
+            console.error("Failed to trigger prediction:", predictionResponse.statusText);
+          }
+        } catch (predictionError) {
+          console.error("Error triggering prediction:", predictionError);
+        }
       }
     }
 
